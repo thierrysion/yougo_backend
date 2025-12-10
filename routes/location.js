@@ -3,7 +3,7 @@ const express = require('express');
 const router = express.Router();
 const { authenticate, requireRole, requireDriver, requireAdmin, optionalAuth } = require('../middleware/auth');
 const { check } = require('express-validator');
-const LocationController = require('../controllers/LocationController.js');
+const LocationController = require('../controllers/locationController.js');
 
 let locationController;
 
