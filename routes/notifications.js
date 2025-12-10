@@ -3,7 +3,7 @@ const express = require('express');
 const router = express.Router();
 const { authenticate, requireRole, requireDriver, requireAdmin, optionalAuth } = require('../middleware/auth');
 const { check } = require('express-validator');
-const NotificationController = require('../controllers/NotificationController.js');
+const NotificationController = require('../controllers/notificationController.js');
 
 let notificationController;
 
