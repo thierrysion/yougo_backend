@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const socketIo = require('socket.io');
+const path = require('path');
 require('dotenv').config();
 
 //Import de la configuration database
@@ -191,6 +192,11 @@ const startCleanupJob = () => {
     }
   }, 24 * 60 * 60 * 1000); // Toutes les 24 heures
 };
+
+// politique de confidentialité
+app.get('/privacy-policy', (req, res) => {
+  res.sendFile(path.join(__dirname, 'privacy-policy/privacy policy.html'));
+});
 
 // Démarrage du serveur
 const startServer = async () => {
