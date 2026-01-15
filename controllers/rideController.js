@@ -6,8 +6,9 @@ const { sequelize } = require('../models');
 const { socketService } = require('../server');
 
 class RideController {
-  constructor(matchingService) {
-    this.matchingService = matchingService;
+  constructor(socketService) {
+    this.socketService = socketService;
+    this.rideMatchingService = socketService.getRideMatchingService();
   }
 
   async requestRide(req, res) {
@@ -21,9 +22,9 @@ class RideController {
         estimatedFare,
         distanceKm,
         estimatedDurationMinutes,
-		baseFare,
-		appliedRulesCount,
-		fareBreakdown,
+		    baseFare,
+		    appliedRulesCount,
+		    fareBreakdown,
         constraints = {}
       } = req.body;
 
@@ -39,7 +40,10 @@ class RideController {
 
       console.log(`🚖 Nouvelle demande de course de ${customerId} vers ${destinationAddress}`);
 
-      // 1. Créer la course en base avec statut 'matching'
+      // 1. Créer la course dans la base de données avec statut 'matching'
+      //const ride = await this.createRideInDatabase(rideData, customerId);
+      // on va implémenter après
+
       const rideId = randomUUID(); //uuidv4();
       const ride = await Ride.create({
         id: rideId,
@@ -85,21 +89,10 @@ class RideController {
       };
 
       // 3. Lancer le matching séquentiel
-      const matchingResult = await this.matchingService.initiateSequentialMatching(rideRequest);
+      //const matchingResult = await this.matchingService.initiateSequentialMatching(rideRequest);
 
-      if (!matchingResult.success) {
-        // Mettre à jour le statut de la course en échec
-        await Ride.update(
-          { status: 'cancelled', cancelled_at: new Date(), cancelled_by: 'system' },
-          { where: { id: rideId } }
-        );
-
-        return res.status(200).json({
-          success: false,
-		  //ride: ride,
-          error: matchingResult.error
-        });
-      }
+      // 3. Démarrer le matching via le service unifié
+      const matchingResult = await this.rideMatchingService.startMatching(rideRequest);
 
       // 4. Retourner la réponse
       res.json({
@@ -122,25 +115,21 @@ class RideController {
           applied_rules_count: appliedRulesCount,
           fareBreakdown: fareBreakdown
         },
-        status: 'matching_started',
+        /*status: 'matching_started',
         message: 'Recherche de chauffeur en cours',
         timing: {
           driverResponseTime: 20, // secondes
           maxWaitTime: Math.min(constraints.maxWaitTime || 300, 120), // Max 2 minutes remettre 120 au lieu de 300
           estimatedWaitTime: matchingResult.estimatedWaitTime
-        },
-        matching: {
-          totalDriversAvailable: matchingResult.totalDriversAvailable,
-          searchRadius: matchingResult.searchRadius,
-          queuePosition: matchingResult.queuePosition
-        }
+        },*/
+        matching: matchingResult
       });
 
     } catch (error) {
       console.error('Erreur demande de course:', error);
       res.status(500).json({
         success: false,
-        error: "Erreur interne du serveur"
+        error: error.message //"Erreur interne du serveur"
       });
     }
   }

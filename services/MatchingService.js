@@ -1,4 +1,471 @@
-// services/MatchingService.js
+// services/ContinuousMatchingService.js
+const redis = require('../config/redis');
+
+class ContinuousMatchingService {
+  constructor(socketService) {
+    this.socketService = socketService;
+    
+    // Clés Redis
+    this.MATCHING_STATE_PREFIX = 'matching:state:';
+    this.MATCHING_TIMERS_PREFIX = 'matching:timers:';
+    this.CONTINUOUS_MATCHING_PREFIX = 'continuous:matching:';
+    this.DRIVER_RESPONSE_TIMEOUTS_PREFIX = 'matching:timeouts:';
+    
+    // Durées
+    this.CONTINUOUS_MATCHING_DURATION = 300; // 5 minutes en secondes
+    this.DRIVER_RESPONSE_TIMEOUT = 20; // 20 secondes en secondes
+    this.CONTINUOUS_SEARCH_INTERVAL = 30; // 30 secondes en secondes
+    
+    // Services Redis
+    this.reservationService = require('./DriverReservationService');
+    this.rideQueueService = require('./RideQueueService');
+    
+    // Démarrer le nettoyage périodique
+    this.startCleanupInterval();
+  }
+
+  async initiateContinuousMatching(rideRequest) {
+    try {
+      console.log(`🔄 Début du matching continu pour la course ${rideRequest.rideId}`);
+      
+      const availableDrivers = await this.findAvailableDrivers(rideRequest);
+      
+      if (availableDrivers.length === 0) {
+        return { 
+          success: false, 
+          error: "Aucun chauffeur disponible dans la zone" 
+        };
+      }
+
+      // État du matching
+      const matchingState = {
+        rideRequest,
+        availableDrivers: availableDrivers.sort((a, b) => b.score - a.score),
+        currentDriverIndex: 0,
+        status: 'searching',
+        notifiedDrivers: [],
+        createdAt: Date.now(),
+        customerId: rideRequest.customerId,
+        continuousMatching: true,
+        matchingStartedAt: Date.now(),
+        matchingDuration: this.CONTINUOUS_MATCHING_DURATION
+      };
+
+      // Sauvegarder l'état dans Redis
+      await this.saveMatchingState(rideRequest.rideId, matchingState);
+      
+      // Ajouter à la file d'attente
+      await this.rideQueueService.addToQueue(rideRequest.rideId, matchingState);
+
+      // Démarrer le matching continu
+      await this.startContinuousMatching(rideRequest.rideId, rideRequest);
+
+      const queueStatus = await this.rideQueueService.getQueueStatus(rideRequest.rideId);
+
+      return {
+        success: true,
+        searchRadius: rideRequest.constraints.searchRadius,
+        totalDriversAvailable: availableDrivers.length,
+        estimatedWaitTime: queueStatus?.estimatedWaitTime || 300,
+        queuePosition: queueStatus?.queuePosition || 1,
+        continuousMatching: true,
+        matchingDuration: this.CONTINUOUS_MATCHING_DURATION
+      };
+
+    } catch (error) {
+      console.error('Erreur matching continu:', error);
+      throw error;
+    }
+  }
+
+  async saveMatchingState(rideId, state) {
+    const key = `${this.MATCHING_STATE_PREFIX}${rideId}`;
+    await redis.set(key, state, this.CONTINUOUS_MATCHING_DURATION);
+  }
+
+  async getMatchingState(rideId) {
+    const key = `${this.MATCHING_STATE_PREFIX}${rideId}`;
+    return await redis.get(key);
+  }
+
+  async deleteMatchingState(rideId) {
+    const key = `${this.MATCHING_STATE_PREFIX}${rideId}`;
+    await redis.del(key);
+  }
+
+  async startContinuousMatching(rideId, rideRequest) {
+    // Sauvegarder les timers dans Redis
+    const timersKey = `${this.MATCHING_TIMERS_PREFIX}${rideId}`;
+    const matchingInfo = {
+      rideId,
+      startTime: Date.now(),
+      endTime: Date.now() + (this.CONTINUOUS_MATCHING_DURATION * 1000),
+      status: 'active',
+      lastSearchAt: Date.now()
+    };
+
+    await redis.set(timersKey, matchingInfo, this.CONTINUOUS_MATCHING_DURATION);
+
+    // Démarrer la notification du premier chauffeur
+    await this.notifyNextDriver(rideId);
+
+    // Démarrer la recherche périodique
+    await this.startPeriodicSearch(rideId, rideRequest);
+
+    console.log(`⏱️ Matching continu démarré pour ${rideId}`);
+  }
+
+  async startPeriodicSearch(rideId, rideRequest) {
+    const searchKey = `${this.CONTINUOUS_MATCHING_PREFIX}${rideId}:search`;
+    
+    const searchInterval = async () => {
+      try {
+        const matchingState = await this.getMatchingState(rideId);
+        if (!matchingState || matchingState.status !== 'searching') {
+          return; // Arrêter si le matching n'est plus actif
+        }
+
+        // Rechercher de nouveaux chauffeurs
+        const updatedDrivers = await this.refreshAvailableDrivers(rideRequest);
+        
+        if (updatedDrivers.length > 0) {
+          await this.integrateNewDrivers(rideId, updatedDrivers, matchingState);
+          
+          // Notifier le client
+          this.socketService.notifyDriverAvailabilityUpdate(
+            matchingState.customerId,
+            rideId,
+            {
+              newDriversFound: updatedDrivers.length,
+              totalAvailable: matchingState.availableDrivers.length,
+              searchRadius: rideRequest.constraints.searchRadius
+            }
+          );
+        }
+
+        // Mettre à jour le timestamp de dernière recherche
+        const timersKey = `${this.MATCHING_TIMERS_PREFIX}${rideId}`;
+        const timers = await redis.get(timersKey);
+        if (timers) {
+          timers.lastSearchAt = Date.now();
+          await redis.set(timersKey, timers, this.CONTINUOUS_MATCHING_DURATION);
+        }
+
+      } catch (error) {
+        console.error('Erreur recherche périodique:', error);
+      }
+    };
+
+    // Exécuter immédiatement puis toutes les 30 secondes
+    await searchInterval();
+    
+    // Stocker l'intervalle ID (simulation - en production utiliser un scheduler)
+    const intervalId = setInterval(searchInterval, this.CONTINUOUS_SEARCH_INTERVAL * 1000);
+    
+    // Stocker l'ID de l'intervalle
+    await redis.hset(searchKey, 'intervalId', intervalId[Symbol.toPrimitive]());
+    await redis.expire(searchKey, this.CONTINUOUS_MATCHING_DURATION);
+  }
+
+  async notifyNextDriver(rideId) {
+    const matchingState = await this.getMatchingState(rideId);
+    
+    if (!matchingState || matchingState.status !== 'searching') {
+      return;
+    }
+
+    const nextDriver = this.findNextAvailableDriver(matchingState);
+    
+    if (!nextDriver) {
+      console.log(`❌ Plus de chauffeurs disponibles pour ${rideId}`);
+      matchingState.status = 'failed';
+      await this.saveMatchingState(rideId, matchingState);
+      await this.rideQueueService.updateRideState(rideId, { status: 'failed' });
+      await this.notifyCustomerNoDrivers(rideId);
+      return;
+    }
+
+    try {
+      // Réserver le chauffeur
+      await this.reservationService.reserveDriver(nextDriver.driverId, rideId);
+      
+      // Mettre à jour l'état
+      matchingState.currentDriverIndex++;
+      matchingState.notifiedDrivers.push({
+        driverId: nextDriver.driverId,
+        notifiedAt: Date.now(),
+        status: 'notified'
+      });
+
+      await this.saveMatchingState(rideId, matchingState);
+      await this.rideQueueService.updateRideState(rideId, matchingState);
+
+      // Notifier le chauffeur
+      const notified = await this.socketService.notifySingleDriver(nextDriver, matchingState.rideRequest);
+      
+      if (!notified) {
+        // Chauffeur déconnecté
+        await this.reservationService.releaseDriver(nextDriver.driverId);
+        setTimeout(() => this.notifyNextDriver(rideId), 500);
+        return;
+      }
+
+      console.log(`📨 Chauffeur ${nextDriver.driverId} notifié pour ${rideId}`);
+
+      // Démarrer le timeout
+      await this.startDriverResponseTimeout(nextDriver.driverId, rideId);
+
+      // Notifier le client
+      const queueStatus = await this.rideQueueService.getQueueStatus(rideId);
+      this.socketService.notifyQueueStatus(matchingState.customerId, queueStatus);
+
+    } catch (error) {
+      console.error(`Erreur notification chauffeur:`, error);
+      await this.reservationService.releaseDriver(nextDriver.driverId);
+      setTimeout(() => this.notifyNextDriver(rideId), 500);
+    }
+  }
+
+  findNextAvailableDriver(matchingState) {
+    for (let i = matchingState.currentDriverIndex; i < matchingState.availableDrivers.length; i++) {
+      const driver = matchingState.availableDrivers[i];
+      if (!this.reservationService.isDriverReserved(driver.driverId)) {
+        return driver;
+      }
+    }
+    return null;
+  }
+
+  async startDriverResponseTimeout(driverId, rideId) {
+    const timeoutKey = `${this.DRIVER_RESPONSE_TIMEOUTS_PREFIX}${rideId}:${driverId}`;
+    const timeoutData = {
+      driverId,
+      rideId,
+      startedAt: Date.now(),
+      expiresAt: Date.now() + (this.DRIVER_RESPONSE_TIMEOUT * 1000)
+    };
+
+    await redis.set(timeoutKey, timeoutData, this.DRIVER_RESPONSE_TIMEOUT);
+
+    // Programmer le traitement du timeout
+    setTimeout(async () => {
+      const currentTimeout = await redis.get(timeoutKey);
+      if (currentTimeout) {
+        console.log(`⏰ Timeout pour le chauffeur ${driverId} - Course ${rideId}`);
+        await this.handleDriverTimeout(driverId, rideId);
+        await redis.del(timeoutKey);
+      }
+    }, this.DRIVER_RESPONSE_TIMEOUT * 1000);
+  }
+
+  async handleDriverAcceptance(driverId, rideId) {
+    const matchingState = await this.getMatchingState(rideId);
+    
+    if (!matchingState || matchingState.status !== 'searching') {
+      return { 
+        success: false, 
+        error: "La course n'est plus disponible" 
+      };
+    }
+
+    try {
+      // 1. Libérer la réservation
+      await this.reservationService.releaseDriver(driverId);
+
+      // 2. Supprimer tous les timeouts pour cette course
+      await this.clearAllTimeoutsForRide(rideId);
+
+      // 3. Marquer comme accepté
+      matchingState.status = 'accepted';
+      matchingState.selectedDriver = driverId;
+      matchingState.acceptedAt = Date.now();
+
+      // 4. Mettre à jour le statut du chauffeur
+      const notifiedDriver = matchingState.notifiedDrivers.find(d => d.driverId === driverId);
+      if (notifiedDriver) {
+        notifiedDriver.status = 'accepted';
+        notifiedDriver.respondedAt = Date.now();
+      }
+
+      await this.saveMatchingState(rideId, matchingState);
+      await this.rideQueueService.updateRideState(rideId, matchingState);
+
+      // 5. Notifier le client
+      const driverInfo = matchingState.availableDrivers.find(d => d.driverId === driverId);
+      await this.socketService.notifyCustomerAssignment(matchingState.customerId, driverInfo, rideId);
+
+      // 6. Nettoyer après un délai
+      setTimeout(async () => {
+        await this.deleteMatchingState(rideId);
+        await this.rideQueueService.removeFromQueue(rideId);
+      }, 60000);
+
+      return { 
+        success: true, 
+        rideId,
+        driver: driverInfo 
+      };
+
+    } catch (error) {
+      console.error('Erreur acceptation chauffeur:', error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  async handleDriverTimeout(driverId, rideId) {
+    const matchingState = await this.getMatchingState(rideId);
+    if (!matchingState) return;
+
+    // Libérer la réservation
+    await this.reservationService.releaseDriver(driverId);
+
+    // Mettre à jour le statut
+    const notifiedDriver = matchingState.notifiedDrivers.find(d => d.driverId === driverId);
+    if (notifiedDriver) {
+      notifiedDriver.status = 'timeout';
+      notifiedDriver.respondedAt = Date.now();
+    }
+
+    await this.saveMatchingState(rideId, matchingState);
+    await this.rideQueueService.updateRideState(rideId, matchingState);
+
+    // Passer au chauffeur suivant
+    setTimeout(() => this.notifyNextDriver(rideId), 500);
+  }
+
+  async clearAllTimeoutsForRide(rideId) {
+    const pattern = `${this.DRIVER_RESPONSE_TIMEOUTS_PREFIX}${rideId}:*`;
+    const keys = await redis.keys(pattern);
+    
+    for (const key of keys) {
+      await redis.del(key);
+    }
+  }
+
+  async refreshAvailableDrivers(rideRequest) {
+    // Implémentation existante de recherche de chauffeurs
+    // À adapter selon votre logique métier
+    return [];
+  }
+
+  async integrateNewDrivers(rideId, newDrivers, matchingState) {
+    const existingDriverIds = new Set(matchingState.availableDrivers.map(d => d.driverId));
+    const trulyNewDrivers = newDrivers.filter(driver => !existingDriverIds.has(driver.driverId));
+
+    if (trulyNewDrivers.length === 0) return;
+
+    matchingState.availableDrivers.push(...trulyNewDrivers);
+    matchingState.availableDrivers.sort((a, b) => b.score - a.score);
+    
+    await this.saveMatchingState(rideId, matchingState);
+    await this.rideQueueService.updateRideState(rideId, matchingState);
+  }
+
+  async getContinuousMatchingStatus(rideId) {
+    const matchingState = await this.getMatchingState(rideId);
+    const timersKey = `${this.MATCHING_TIMERS_PREFIX}${rideId}`;
+    const timers = await redis.get(timersKey);
+    
+    if (!matchingState || !timers) {
+      return null;
+    }
+
+    const now = Date.now();
+    const elapsed = Math.floor((now - timers.startTime) / 1000);
+    const remaining = Math.floor((timers.endTime - now) / 1000);
+
+    return {
+      isActive: matchingState.status === 'searching',
+      elapsedTime: elapsed,
+      remainingTime: remaining > 0 ? remaining : 0,
+      totalDuration: this.CONTINUOUS_MATCHING_DURATION,
+      driversNotified: matchingState.notifiedDrivers.length,
+      driversAvailable: matchingState.availableDrivers.length,
+      currentDriverIndex: matchingState.currentDriverIndex,
+      status: matchingState.status,
+      lastSearchAt: new Date(timers.lastSearchAt).toISOString()
+    };
+  }
+
+  async extendMatchingTime(rideId, additionalSeconds = 180) {
+    const matchingState = await this.getMatchingState(rideId);
+    const timersKey = `${this.MATCHING_TIMERS_PREFIX}${rideId}`;
+    
+    if (!matchingState || !timers) {
+      throw new Error('Matching non trouvé');
+    }
+
+    // Mettre à jour les timers
+    timers.endTime += (additionalSeconds * 1000);
+    await redis.set(timersKey, timers, additionalSeconds);
+
+    // Mettre à jour l'état
+    matchingState.status = 'searching';
+    matchingState.matchingDuration += additionalSeconds;
+    await this.saveMatchingState(rideId, matchingState);
+
+    console.log(`⏱️ Matching étendu de ${additionalSeconds}s pour ${rideId}`);
+  }
+
+  async stopContinuousMatching(rideId) {
+    // Supprimer tous les états Redis
+    await this.deleteMatchingState(rideId);
+    
+    const timersKey = `${this.MATCHING_TIMERS_PREFIX}${rideId}`;
+    await redis.del(timersKey);
+    
+    const searchKey = `${this.CONTINUOUS_MATCHING_PREFIX}${rideId}:search`;
+    await redis.del(searchKey);
+    
+    await this.clearAllTimeoutsForRide(rideId);
+    await this.rideQueueService.removeFromQueue(rideId);
+    
+    console.log(`🛑 Matching continu arrêté pour ${rideId}`);
+  }
+
+  startCleanupInterval() {
+    // Nettoyage périodique des données expirées
+    setInterval(async () => {
+      try {
+        // Nettoyer les états de matching expirés
+        const pattern = `${this.MATCHING_STATE_PREFIX}*`;
+        const keys = await redis.keys(pattern);
+        
+        for (const key of keys) {
+          const ttl = await redis.client.ttl(key);
+          if (ttl < 0) {
+            await redis.del(key);
+          }
+        }
+
+        // Nettoyer les timers expirés
+        const timerPattern = `${this.MATCHING_TIMERS_PREFIX}*`;
+        const timerKeys = await redis.keys(timerPattern);
+        
+        for (const key of timerKeys) {
+          const ttl = await redis.client.ttl(key);
+          if (ttl < 0) {
+            await redis.del(key);
+          }
+        }
+
+      } catch (error) {
+        console.error('Erreur nettoyage Redis:', error);
+      }
+    }, 5 * 60 * 1000); // Toutes les 5 minutes
+  }
+}
+
+module.exports = ContinuousMatchingService;
+
+
+
+
+////////////////////////: OLD IMPLEMENTATION //////////////////////////////
+
+
+
+/*// services/MatchingService.js
 const { sequelize, Driver, Ride, RideType, User } = require('../models');
 const DriverReservationService = require('./DriverReservationService');
 const RideQueueService = require('./RideQueueService');
@@ -435,3 +902,4 @@ class MatchingService {
 }
 
 module.exports = MatchingService;
+*/

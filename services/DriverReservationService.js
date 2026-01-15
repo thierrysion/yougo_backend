@@ -1,4 +1,107 @@
 // services/DriverReservationService.js
+const redis = require('../config/redis');
+
+class DriverReservationService {
+  constructor() {
+    this.RESERVATION_DURATION = 20; // 20 secondes
+    this.RESERVATION_KEY_PREFIX = 'reservation:';
+    this.RIDE_RESERVATION_KEY_PREFIX = 'ride:reservations:';
+  }
+
+  async reserveDriver(driverId, rideId) {
+    try {
+      // Vérifier que le chauffeur n'est pas déjà réservé
+      const existingReservation = await this.getReservation(driverId);
+      if (existingReservation) {
+        throw new Error(`Driver ${driverId} already reserved`);
+      }
+
+      const reservation = {
+        driverId,
+        rideId,
+        reservedUntil: Date.now() + (this.RESERVATION_DURATION * 1000),
+        status: 'reserved',
+        createdAt: Date.now()
+      };
+
+      // Stocker la réservation avec TTL
+      const reservationKey = `${this.RESERVATION_KEY_PREFIX}${driverId}`;
+      await redis.set(reservationKey, reservation, this.RESERVATION_DURATION);
+
+      // Ajouter à la liste des réservations de la course
+      const rideReservationKey = `${this.RIDE_RESERVATION_KEY_PREFIX}${rideId}`;
+      await redis.sadd(rideReservationKey, driverId);
+      await redis.expire(rideReservationKey, this.RESERVATION_DURATION);
+
+      console.log(`✅ Chauffeur ${driverId} réservé pour la course ${rideId}`);
+      return reservation;
+
+    } catch (error) {
+      console.error('Erreur réservation chauffeur:', error);
+      throw error;
+    }
+  }
+
+  async isDriverReserved(driverId) {
+    const reservationKey = `${this.RESERVATION_KEY_PREFIX}${driverId}`;
+    const reservation = await redis.get(reservationKey);
+    
+    if (!reservation) return false;
+    
+    // Vérifier si la réservation est expirée
+    if (reservation.reservedUntil < Date.now()) {
+      await this.releaseDriver(driverId);
+      return false;
+    }
+    
+    return true;
+  }
+
+  async releaseDriver(driverId) {
+    const reservationKey = `${this.RESERVATION_KEY_PREFIX}${driverId}`;
+    const reservation = await redis.get(reservationKey);
+    
+    if (reservation) {
+      // Supprimer de la liste des réservations de la course
+      const rideReservationKey = `${this.RIDE_RESERVATION_KEY_PREFIX}${reservation.rideId}`;
+      await redis.srem(rideReservationKey, driverId);
+      
+      // Supprimer la réservation
+      await redis.del(reservationKey);
+      console.log(`🔓 Chauffeur ${driverId} libéré`);
+      return true;
+    }
+    
+    return false;
+  }
+
+  async getReservation(driverId) {
+    const reservationKey = `${this.RESERVATION_KEY_PREFIX}${driverId}`;
+    return await redis.get(reservationKey);
+  }
+
+  async getRideReservations(rideId) {
+    const rideReservationKey = `${this.RIDE_RESERVATION_KEY_PREFIX}${rideId}`;
+    return await redis.smembers(rideReservationKey);
+  }
+
+  async cleanupExpiredReservations() {
+    // Cette méthode peut être appelée périodiquement pour nettoyer
+    // mais avec TTL Redis le fait automatiquement
+    console.log('🧹 Redis TTL gère automatiquement les réservations expirées');
+  }
+}
+
+module.exports = DriverReservationService;
+
+
+
+////////////////////// OLD IMPLEMENTATION ////////////////////////////////
+
+
+
+
+/*// services/DriverReservationService.js
 const { Driver } = require('../models');
 
 class DriverReservationService {
@@ -86,4 +189,4 @@ class DriverReservationService {
   }
 }
 
-module.exports = DriverReservationService;
+module.exports = DriverReservationService;*/

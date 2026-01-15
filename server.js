@@ -82,7 +82,7 @@ pushTokenService.startCleanupInterval();
 // Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/pricing', pricingRoutes);
-app.use('/api/rides', rideRoutes(matchingService));
+app.use('/api/rides', rideRoutes(socketService));
 app.use('/api/rides', rideStatusRoutes(rideStatusService));
 app.use('/api/location', locationRoutes(locationService, routingService));
 app.use('/api/notifications', notificationRoutes(notificationService, pushTokenService));
@@ -258,3 +258,28 @@ process.on('SIGINT', async () => {
 startServer();
 
 module.exports =  { app, server, socketService, io };
+
+/*
+// server.js
+const RedisSyncService = require('./services/RedisSyncService');
+const redisSyncService = new RedisSyncService();
+
+// Au démarrage du serveur
+async function initializeSystem() {
+  console.log('🚀 Initialisation système...');
+  
+  // 1. Synchroniser les courses actives depuis DB
+  await redisSyncService.syncActiveRidesToRedis();
+  
+  // 2. Démarrer le service de synchro périodique
+  redisSyncService.startSyncService();
+  
+  // 3. Nettoyer les données Redis expirées
+  await cleanupExpiredRedisData();
+  
+  console.log('✅ Système initialisé');
+}
+
+// Au démarrage
+initializeSystem().catch(console.error);
+*/

@@ -28,8 +28,8 @@ const validateDriverResponse = [
 ];
 
 // Initialisation avec le matchingService
-module.exports = (matchingService) => {
-  rideController = new RideController(matchingService);
+module.exports = (socketService) => {
+  rideController = new RideController(socketService);
   
   // POST /api/rides/request - Demander une course
   router.post('/request', [authenticate/*, validateRideRequest*/], (req, res) => {
