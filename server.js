@@ -195,7 +195,17 @@ const startCleanupJob = () => {
 
 // politique de confidentialité
 app.get('/privacy-policy', (req, res) => {
-  res.sendFile(path.join(__dirname, 'privacy-policy/privacy policy.html'));
+  res.sendFile(path.join(__dirname, 'privacy-policy/privacypolicy.html'));
+});
+
+// conditions d'utilisation
+app.get('/terms-of-use', (req, res) => {
+  res.sendFile(path.join(__dirname, 'static/termofuse.html'));
+});
+
+// support
+app.get('/support', (req, res) => {
+  res.sendFile(path.join(__dirname, 'static/support.html'));
 });
 
 // Démarrage du serveur
