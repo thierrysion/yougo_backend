@@ -1,12 +1,13 @@
 // services/RedisIntervalManager.js
 const redis = require('../config/redis');
-const { v4: uuidv4 } = require('uuid');
+//const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('crypto');
 
 class RedisIntervalManager {
   constructor() {
     this.localIntervals = new Map(); // Pour nettoyage local seulement
     this.localCallbacks = new Map(); // Stockage local des callbacks
-    this.instanceId = uuidv4(); // Identifiant unique de l'instance
+    this.instanceId = randomUUID(); //uuidv4(); // Identifiant unique de l'instance
     this.INTERVAL_TTL = 300; // 5 minutes (doit être > interval duration)
   
     // Clés Redis structurées
@@ -24,7 +25,7 @@ class RedisIntervalManager {
    * Créer un intervalle géré par Redis
    */
   async createInterval(key, callback, intervalMs, data = {}) {
-    const intervalId = `${key}:${this.instanceId}:${uuidv4()}`;
+    const intervalId = `${key}:${this.instanceId}:${randomUUID()/*uuidv4()*/}`;
     
     console.log(`⏱️  Création intervalle Redis: ${intervalId}`);
     
